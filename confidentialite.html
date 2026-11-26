@@ -13,7 +13,7 @@ p,li{color:var(--fg)} .mut{color:var(--mut);font-size:.9rem} a{color:var(--acc)}
 ul{padding-left:20px} footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line)}
 </style></head><body><main>
 <h1>Règles de confidentialité</h1>
-<p class="mut">Dernière mise à jour : 30 octobre 2026</p>
+<p class="mut">Dernière mise à jour : 26 novembre 2026</p>
 <p>CNG Vinted est une application web qui aide les vendeurs à suivre leurs ventes, achats, dépenses et bénéfices. Cette page explique quelles données l’appli utilise et ce qu’elle en fait.</p>
 
 <h2>En bref</h2>
@@ -40,8 +40,14 @@ ul{padding-left:20px} footer{margin-top:40px;padding-top:16px;border-top:1px sol
 <ul>
 <li><strong>Notifications</strong> : si tu les actives, un message court (par exemple « Nouvelle vente : 25 € ») passe par le service ntfy.sh pour arriver sur ton téléphone.</li>
 <li><strong>Script Google personnel</strong> (option avancée) : si tu l’installes, il tourne dans ton propre compte Google.</li>
-<li><strong>Fonctions d’IA</strong> : seulement si tu entres ta propre clé ; le texte concerné est alors envoyé à ce fournisseur. Les e-mails Gmail ne lui sont jamais envoyés.</li>
+<li><strong>Annonce IA avec ta clé Claude</strong> : si tu entres ta propre clé, les photos et les infos que tu donnes sont envoyées à Anthropic (Claude) quand tu touches « Rédiger l’annonce ». Les e-mails Gmail ne lui sont jamais envoyés.</li>
+<li><strong>Annonce IA gratuite</strong> : sans clé, les photos (3 au plus, réduites) et les infos que tu donnes passent par le serveur de cngapp.com et sont analysées par l’IA de Cloudflare (Workers AI). Elles ne sont pas conservées. Pour limiter les abus, le serveur compte le nombre de demandes par jour à partir d’une empreinte de ton adresse IP (pas l’adresse elle-même), effacée au bout de 2 jours.</li>
+<li><strong>Notifications des tendances</strong> (bêta) : si tu les actives, l’adresse de notification de ton téléphone (fournie par Apple, Google, Mozilla ou Microsoft) est enregistrée sur le serveur de cngapp.com pour t’envoyer les nouvelles tendances. Elle est supprimée quand tu coupes les notifications ou qu’elle n’est plus valable.</li>
+<li><strong>Vérification anti-robots</strong> : avant une annonce IA gratuite ou un avis de testeur, Cloudflare Turnstile vérifie que tu n’es pas un robot (le plus souvent sans rien te demander). <a href="https://www.cloudflare.com/turnstile-privacy-policy/">Confidentialité de Turnstile</a>.</li>
 </ul>
+
+<h2>Hébergement et statistiques de visites</h2>
+<p>Le site cngapp.com est hébergé par Cloudflare. Pour savoir combien de personnes visitent le site et quelles pages sont lues, il utilise Cloudflare Web Analytics : <strong>sans cookie</strong>, sans suivi d’une visite à l’autre, et sans rien de ce que tu enregistres dans l’appli (tes données restent sur ton appareil). <a href="https://www.cloudflare.com/privacypolicy/">Politique de confidentialité de Cloudflare</a>.</p>
 
 <h2>Statistiques d’utilisation anonymes</h2>
 <p>Pour savoir combien de personnes utilisent l’appli, chaque appareil envoie au créateur de l’appli (via son script Google), à l’ouverture puis toutes les 5 minutes tant que l’appli est affichée : un identifiant tiré au hasard sur l’appareil, le type d’appareil (par exemple « iPhone · iOS 18 »), la version de l’appli, le code testeur en version bêta, et si la connexion Google est active. Aucune vente, aucun montant, aucun nom ni adresse e-mail. Tu peux désactiver cet envoi dans Réglages → Statistiques anonymes.</p>

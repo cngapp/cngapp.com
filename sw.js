@@ -2,7 +2,7 @@
 // Les données ne passent jamais par ici : elles restent dans IndexedDB sur l'appareil.
 const SCOPE = self.registration.scope;
 // un cache par version publiée (principale et bêta partagent le même site)
-const CACHE = 'vpa-v5:' + SCOPE;
+const CACHE = 'vpa-v6:' + SCOPE;
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll([SCOPE, SCOPE + 'manifest.webmanifest', SCOPE + 'icon.svg'])));
@@ -19,6 +19,8 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
+  // serveur de l'appli (annonce IA, avis, notifications) : jamais mis en cache
+  if (url.origin === self.location.origin && url.pathname.startsWith('/api/')) return;
   // la version bêta (sous-dossier beta/) a son propre service worker
   if (url.href.startsWith(SCOPE + 'beta/')) return;
   // Pages publiques (présentation, guides, pages légales) : toujours le réseau, jamais mises en cache
@@ -59,4 +61,27 @@ self.addEventListener('fetch', (e) => {
       ),
     );
   }
+});
+
+// Notifications (ex. « Nouvelle tendance ») envoyées par le serveur de cngapp.com
+self.addEventListener('push', (e) => {
+  let m = {};
+  try { m = e.data ? e.data.json() : {}; } catch { m = { body: e.data && e.data.text() }; }
+  e.waitUntil(self.registration.showNotification(m.title || 'CNG Vinted', {
+    body: m.body || '',
+    icon: SCOPE + 'icon-192.png',
+    badge: SCOPE + 'icon-192.png',
+    tag: m.tag || undefined,
+    data: { url: SCOPE + (m.url || '') },
+  }));
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const target = (e.notification.data && e.notification.data.url) || SCOPE;
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((cs) => {
+    const open = cs.find((c) => c.url.startsWith(SCOPE));
+    if (open) return open.focus().then(() => open.navigate(target)).catch(() => self.clients.openWindow(target));
+    return self.clients.openWindow(target);
+  }));
 });
