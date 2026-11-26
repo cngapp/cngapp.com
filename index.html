@@ -2,7 +2,7 @@
 <html lang="fr">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-etPb9sWJrIbtOKbuqwJZI7StgROWSu9xIOgGEVaF2GM=' 'wasm-unsafe-eval' https://cdn.jsdelivr.net https://challenges.cloudflare.com https://static.cloudflareinsights.com; frame-src https://challenges.cloudflare.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https://script.google.com https://script.googleusercontent.com https://ntfy.sh https://gmail.googleapis.com https://www.googleapis.com https://oauth2.googleapis.com https://api.anthropic.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com https://challenges.cloudflare.com https://cloudflareinsights.com; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-ApAjtTFthVAddI29CmQ+dlu8MvoIFHxqBxbw4lOAfYg=' 'wasm-unsafe-eval' https://cdn.jsdelivr.net https://challenges.cloudflare.com https://static.cloudflareinsights.com; frame-src https://challenges.cloudflare.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https://script.google.com https://script.googleusercontent.com https://ntfy.sh https://gmail.googleapis.com https://www.googleapis.com https://oauth2.googleapis.com https://api.anthropic.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com https://challenges.cloudflare.com https://cloudflareinsights.com; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#090B0A" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -26,7 +26,7 @@
     <link rel="icon" href="./icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./icon-180.png" />
     <title>CNG Vinted — Appli gratuite de compta Vinted</title>
-    <script type="module" crossorigin src="/assets/index-cMzNcjsR.js"></script>
+    <script type="module" crossorigin src="/assets/index-BoeN7QAe.js"></script>
     <link rel="stylesheet" crossorigin href="/assets/index-DPqcx_72.css">
   </head>
   <body>
@@ -45,6 +45,9 @@
       <div class="sp-skip">Touche l'écran pour passer</div>
     </div>
     <script>
+      // dans le navigateur, l'écran de chargement ne dure que 2,5 s : version courte de l'animation, logo complet
+      // (l'appli installée garde la version longue)
+      if (!(window.matchMedia && matchMedia('(display-mode: standalone)').matches) && navigator.standalone !== true) document.getElementById('splash').classList.add('sp-fast');
       // toucher l'écran de chargement le fait disparaître tout de suite
       document.getElementById('splash').addEventListener('click', function () {
         window.__splashSkipped = true;
@@ -64,6 +67,14 @@
       #splash .sp-line { stroke-dasharray: 1; stroke-dashoffset: 1; animation: sp-draw 4s 3.5s cubic-bezier(.45,0,.25,1) forwards; }
       #splash .sp-head { opacity: 0; animation: sp-fade .6s 7.4s ease forwards; }
       #splash .sp-skip { position: absolute; bottom: calc(env(safe-area-inset-bottom, 0px) + 28px); color: #6B6F6B; font: 500 13px/1 'Manrope Variable', 'Manrope', system-ui, -apple-system, sans-serif; opacity: 0; animation: sp-fade 1s 2.5s ease forwards; }
+      #splash.sp-fast .sp-l { animation-duration: .5s; }
+      #splash.sp-fast .sp-l:nth-child(1) { animation-delay: 0s; }
+      #splash.sp-fast .sp-l:nth-child(2) { animation-delay: .15s; }
+      #splash.sp-fast .sp-l:nth-child(3) { animation-delay: .3s; }
+      #splash.sp-fast .sp-line { animation-duration: .9s; animation-delay: .55s; }
+      #splash.sp-fast .sp-head { animation-duration: .3s; animation-delay: 1.4s; }
+      #splash.sp-fast .sp-name { animation-duration: .5s; animation-delay: .9s; }
+      #splash.sp-fast .sp-skip { display: none; }
       @keyframes sp-draw { to { stroke-dashoffset: 0; } }
       @keyframes sp-fade { to { opacity: 1; } }
       @media (prefers-reduced-motion: reduce) {
