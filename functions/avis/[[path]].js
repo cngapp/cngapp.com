@@ -13,7 +13,7 @@ export function renderReviews(html, reviews, site = 'https://cngapp.com') {
   const avgTxt = avg.toFixed(1).replace('.', ',');
   const list = n
     ? reviews.map((r) => `<figure class="card review"><div>${stars(r.note)}</div><blockquote>${esc(r.texte).replace(/\n/g, '<br>')}</blockquote><figcaption>${esc(r.nom)} · ${new Date(r.cree).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })}</figcaption></figure>`).join('\n')
-    : '<p class="mut">Pas encore d’avis publié. Sois le premier : Menu → Noter l’appli.</p>';
+    : '<p class="mut">Pas encore d’avis publié. Sois le premier : Menu → Avis.</p>';
   const note = n ? `<p class="lead"><b>${avgTxt} / 5</b> ${stars(Math.round(avg))} · ${n} avis</p>` : '';
   const app = {
     '@type': 'SoftwareApplication', '@id': `${site}/#app-avis`, name: 'CNG Vinted', applicationCategory: 'FinanceApplication', operatingSystem: 'iOS, Android, Web', url: `${site}/`,
