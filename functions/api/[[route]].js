@@ -1,0 +1,267 @@
+/**
+ * Serveur de cngapp.com (Cloudflare Pages Functions), sous /api/ :
+ *   POST /api/annonce           Annonce IA gratuite (Workers AI, photos → titre/description), protégée par Turnstile
+ *   POST /api/retour            Avis des testeurs : vérifié par Turnstile puis transmis (e-mail via le script Google + ntfy)
+ *   POST /api/push/abonner      Notifications « Nouvelle tendance » (bêta) : enregistre l'abonnement du téléphone
+ *   POST /api/push/desabonner   Retire l'abonnement
+ *   POST /api/push/tendance     Prévient les abonnés de la dernière tendance publiée (une seule fois par tendance)
+ *
+ * Ce fichier est public (comme le reste du site) : AUCUN secret ici. Les clés sont dans les réglages du projet
+ * Cloudflare (TURNSTILE_SECRET, VAPID_PRIVATE) ; liaisons : AI (Workers AI), CNG (stockage KV).
+ */
+
+export const AI_FREE_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct';
+export const LIMITS = { perIpPerDay: 12, totalPerDay: 400, images: 3, imageChars: 600_000 };
+const CONDITIONS = ['Neuf avec étiquette', 'Neuf sans étiquette', 'Très bon état', 'Bon état', 'Satisfaisant'];
+const PUSH_HOSTS = /^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|[a-z0-9-]+\.notify\.windows\.com|[a-z0-9.-]+\.push\.apple\.com)$/;
+
+const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+const fail = (status, erreur) => json({ ok: false, erreur }, status);
+const day = (now = Date.now()) => new Date(now).toISOString().slice(0, 10);
+
+// ---------------------------------------------------------------------------
+// Utilitaires
+// ---------------------------------------------------------------------------
+
+export function b64uEncode(bytes) {
+  let bin = '';
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (let i = 0; i < b.length; i++) bin += String.fromCharCode(b[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+export function b64uDecode(s) {
+  const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+const enc = new TextEncoder();
+const concat = (...parts) => { const n = parts.reduce((a, p) => a + p.length, 0); const o = new Uint8Array(n); let i = 0; for (const p of parts) { o.set(p, i); i += p.length; } return o; };
+async function sha256hex(s) { return [...new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s)))].map((x) => x.toString(16).padStart(2, '0')).join(''); }
+
+export async function turnstileOk(env, token, ip, fetcher = fetch) {
+  if (!token || typeof token !== 'string' || token.length > 4096 || !env.TURNSTILE_SECRET) return false;
+  const body = new URLSearchParams({ secret: env.TURNSTILE_SECRET, response: token });
+  if (ip) body.set('remoteip', ip);
+  try {
+    const r = await fetcher('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body });
+    const j = await r.json();
+    return j.success === true;
+  } catch { return false; }
+}
+
+/** Compteur journalier (stockage KV). Renvoie false si la limite est atteinte. */
+async function underLimit(kv, key, max) {
+  const n = Number((await kv.get(key)) || 0);
+  if (n >= max) return false;
+  await kv.put(key, String(n + 1), { expirationTtl: 2 * 86400 });
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Annonce IA gratuite
+// ---------------------------------------------------------------------------
+
+export function freeListingPrompt(categories, notes) {
+  return `Tu rédiges une annonce Vinted en français pour un vendeur de vêtements de seconde main, à partir des photos.
+Règles :
+- N'invente rien : marque, taille, matière ou défaut seulement s'ils sont lisibles sur les photos ou donnés par le vendeur, sinon null / liste vide.
+- Aucun prix, aucun chiffre de vente.
+- Titre accrocheur, 60 caractères maximum, format « Type Marque Détail clé couleur - Taille X » (sans la taille si inconnue).
+- Description courte et honnête (4 à 7 lignes) : ce que c'est, style, état, défauts éventuels, conseil de taille si visible ; ton simple et chaleureux, tutoiement, pas d'emojis excessifs.
+- 5 à 8 hashtags pertinents sans espaces.
+- Catégorie parmi : ${categories.join(', ')}.
+- État parmi : ${CONDITIONS.join(', ')}.
+${notes ? `Infos du vendeur (fiables) : ${notes}\n` : ''}Réponds UNIQUEMENT avec un objet JSON : {"title":"","description":"","brand":null,"size":null,"condition":null,"category":"","color":null,"hashtags":[],"defects":[]}`;
+}
+
+/** Vérifie et nettoie la demande (rien d'autre que des photos JPEG, quelques mots et la liste de catégories). */
+export function cleanListingRequest(d) {
+  if (!d || typeof d !== 'object') return null;
+  const images = Array.isArray(d.images) ? d.images.filter((x) => typeof x === 'string' && /^[A-Za-z0-9+/=]+$/.test(x) && x.length <= LIMITS.imageChars).slice(0, LIMITS.images) : [];
+  if (!images.length) return null;
+  const notes = typeof d.notes === 'string' ? d.notes.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 300) : '';
+  const cats = Array.isArray(d.categories) ? d.categories.filter((c) => typeof c === 'string' && c.trim()).map((c) => c.replace(/[\u0000-\u001f,]/g, ' ').trim().slice(0, 40)).slice(0, 40) : [];
+  return { images, notes, categories: cats.length ? cats : ['Autres vêtements'] };
+}
+
+async function annonce(request, env) {
+  const ip = request.headers.get('cf-connecting-ip') || '';
+  const d = await request.json().catch(() => null);
+  if (!(await turnstileOk(env, d && d.token, ip))) return fail(403, 'verification');
+  const req = cleanListingRequest(d);
+  if (!req) return fail(400, 'photos');
+  const today = day();
+  if (!(await underLimit(env.CNG, `ia:${today}`, LIMITS.totalPerDay))) return fail(429, 'quota-global');
+  if (!(await underLimit(env.CNG, `ia:${today}:${await sha256hex(ip)}`, LIMITS.perIpPerDay))) return fail(429, 'quota');
+  let out;
+  try {
+    out = await env.AI.run(AI_FREE_MODEL, {
+      messages: [{ role: 'user', content: [{ type: 'text', text: freeListingPrompt(req.categories, req.notes) }, ...req.images.map((b) => ({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b}` } }))] }],
+      max_tokens: 900,
+      temperature: 0.4,
+    });
+  } catch {
+    return fail(503, 'ia');
+  }
+  const text = typeof out?.response === 'string' ? out.response : out?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string' || !text.trim()) return fail(502, 'ia');
+  return json({ ok: true, text });
+}
+
+// ---------------------------------------------------------------------------
+// Avis des testeurs
+// ---------------------------------------------------------------------------
+
+async function retour(request, env) {
+  const ip = request.headers.get('cf-connecting-ip') || '';
+  const d = await request.json().catch(() => null);
+  if (!(await turnstileOk(env, d && d.token, ip))) return fail(403, 'verification');
+  const s = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
+  const title = s(d.title, 120), message = s(d.message, 3800), contact = s(d.contact, 120), topic = s(d.topic, 80);
+  if (message.trim().length < 3) return fail(400, 'message');
+  if (!(await underLimit(env.CNG, `avis:${day()}:${await sha256hex(ip)}`, 20))) return fail(429, 'quota');
+  const tags = Array.isArray(d.tags) ? d.tags.filter((t) => typeof t === 'string').slice(0, 3) : [];
+  const priority = [3, 4].includes(d.priority) ? d.priority : 3;
+  const [mailed, pushed] = await Promise.all([
+    env.APPS_SCRIPT_URL
+      ? fetch(env.APPS_SCRIPT_URL, { method: 'POST', headers: { 'content-type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ app: 'cng-vinted', title, message, contact }), redirect: 'follow' })
+          .then(async (r) => r.ok && (await r.json().catch(() => null))?.ok === true).catch(() => false)
+      : false,
+    topic ? fetch('https://ntfy.sh/', { method: 'POST', body: JSON.stringify({ topic, title, message, tags, priority }) }).then((r) => r.ok, () => false) : false,
+  ]);
+  if (!mailed && !pushed) return fail(502, 'envoi');
+  return json({ ok: true, mailed, pushed });
+}
+
+// ---------------------------------------------------------------------------
+// Notifications (Web Push : RFC 8291 chiffrement aes128gcm + RFC 8292 VAPID)
+// ---------------------------------------------------------------------------
+
+export function cleanSubscription(sub) {
+  if (!sub || typeof sub.endpoint !== 'string' || sub.endpoint.length > 1000) return null;
+  let u;
+  try { u = new URL(sub.endpoint); } catch { return null; }
+  if (u.protocol !== 'https:' || !PUSH_HOSTS.test(u.hostname)) return null;
+  const k = sub.keys || {};
+  if (typeof k.p256dh !== 'string' || typeof k.auth !== 'string') return null;
+  try { if (b64uDecode(k.p256dh).length !== 65 || b64uDecode(k.auth).length !== 16) return null; } catch { return null; }
+  return { endpoint: sub.endpoint, keys: { p256dh: k.p256dh, auth: k.auth } };
+}
+
+async function hkdf(salt, ikm, info, bytes) {
+  const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info }, key, bytes * 8));
+}
+
+/** Chiffre un message pour un abonnement (aes128gcm). `salt` et `serverKeys` ne servent qu'aux tests. */
+export async function encryptPush(sub, payload, { salt = crypto.getRandomValues(new Uint8Array(16)), serverKeys } = {}) {
+  const ua = b64uDecode(sub.keys.p256dh);
+  const auth = b64uDecode(sub.keys.auth);
+  const as = serverKeys || (await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']));
+  const asPub = new Uint8Array(await crypto.subtle.exportKey('raw', as.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', ua, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, as.privateKey, 256));
+  const ikm = await hkdf(auth, shared, concat(enc.encode('WebPush: info\0'), ua, asPub), 32);
+  const cek = await hkdf(salt, ikm, enc.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await hkdf(salt, ikm, enc.encode('Content-Encoding: nonce\0'), 12);
+  const key = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  const plain = concat(enc.encode(payload), new Uint8Array([2]));
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, plain));
+  const rs = new Uint8Array([0, 0, 0x10, 0]); // 4096
+  return concat(salt, rs, new Uint8Array([asPub.length]), asPub, cipher);
+}
+
+export async function vapidAuthorization(env, endpoint, now = Date.now()) {
+  const jwk = JSON.parse(env.VAPID_PRIVATE);
+  const key = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const head = b64uEncode(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const body = b64uEncode(enc.encode(JSON.stringify({ aud: new URL(endpoint).origin, exp: Math.floor(now / 1000) + 12 * 3600, sub: env.VAPID_SUBJECT || 'https://cngapp.com' })));
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(`${head}.${body}`)));
+  return `vapid t=${head}.${body}.${b64uEncode(sig)}, k=${env.VAPID_PUBLIC}`;
+}
+
+export async function sendPush(env, sub, message, fetcher = fetch) {
+  const body = await encryptPush(sub, JSON.stringify(message));
+  const r = await fetcher(sub.endpoint, {
+    method: 'POST',
+    headers: { Authorization: await vapidAuthorization(env, sub.endpoint), 'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', TTL: '86400', Urgency: 'normal' },
+    body,
+  });
+  return r.status;
+}
+
+async function abonner(request, env) {
+  const d = await request.json().catch(() => null);
+  const sub = cleanSubscription(d && d.subscription);
+  if (!sub) return fail(400, 'abonnement');
+  await env.CNG.put(`abo:${await sha256hex(sub.endpoint)}`, JSON.stringify({ ...sub, since: new Date().toISOString() }));
+  return json({ ok: true });
+}
+
+async function desabonner(request, env) {
+  const d = await request.json().catch(() => null);
+  if (!d || typeof d.endpoint !== 'string') return fail(400, 'abonnement');
+  await env.CNG.delete(`abo:${await sha256hex(d.endpoint)}`);
+  return json({ ok: true });
+}
+
+/** Message de notification pour une tendance (données venant du script Google, déjà publiques). */
+export function trendMessage(t) {
+  const name = [t.brand, t.title].filter((x) => typeof x === 'string' && x.trim()).join(' · ').slice(0, 90) || 'Un nouvel article';
+  const extra = [typeof t.likes === 'number' ? `${t.likes} ❤️` : '', typeof t.price === 'number' ? `${(t.price / 100).toFixed(2).replace('.', ',')} €` : ''].filter(Boolean).join(' · ');
+  return { title: '🔥 Nouvelle tendance', body: extra ? `${name} — ${extra}` : name, url: '#/tendances', tag: `tendance-${t.id}` };
+}
+
+/** Choisit la tendance à annoncer : la plus récemment AJOUTÉE (pas modifiée), il y a moins de 30 min. */
+export function latestNewTrend(items, now = Date.now()) {
+  const fresh = (Array.isArray(items) ? items : []).filter((t) => t && typeof t.id === 'string' && Date.parse(t.addedAt) > now - 30 * 60_000);
+  return fresh.sort((a, b) => Date.parse(b.addedAt) - Date.parse(a.addedAt))[0] || null;
+}
+
+async function tendance(env) {
+  const r = await fetch(`${env.APPS_SCRIPT_URL}?action=tendances`, { redirect: 'follow' }).catch(() => null);
+  const data = r && (await r.json().catch(() => null));
+  const t = latestNewTrend(data && data.items);
+  if (!t) return json({ ok: true, envoyes: 0 });
+  const done = `notifie:${t.id}`;
+  if (await env.CNG.get(done)) return json({ ok: true, envoyes: 0 });
+  await env.CNG.put(done, '1', { expirationTtl: 30 * 86400 });
+  const msg = trendMessage(t);
+  let sent = 0, cursor;
+  do {
+    const page = await env.CNG.list({ prefix: 'abo:', cursor });
+    await Promise.all(page.keys.map(async ({ name }) => {
+      const sub = JSON.parse((await env.CNG.get(name)) || 'null');
+      if (!sub) return;
+      const status = await sendPush(env, sub, msg).catch(() => 0);
+      if (status === 404 || status === 410) await env.CNG.delete(name);
+      else if (status >= 200 && status < 300) sent++;
+    }));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return json({ ok: true, envoyes: sent });
+}
+
+// ---------------------------------------------------------------------------
+
+export async function onRequest({ request, env }) {
+  const path = new URL(request.url).pathname.replace(/\/+$/, '');
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204 });
+  if (request.method !== 'POST') return fail(405, 'methode');
+  // uniquement depuis le site lui-même (pas d'autres sites qui utiliseraient ces services)
+  const origin = request.headers.get('origin');
+  if (origin && new URL(origin).host !== new URL(request.url).host) return fail(403, 'origine');
+  try {
+    switch (path) {
+      case '/api/annonce': return await annonce(request, env);
+      case '/api/retour': return await retour(request, env);
+      case '/api/push/abonner': return await abonner(request, env);
+      case '/api/push/desabonner': return await desabonner(request, env);
+      case '/api/push/tendance': return await tendance(env);
+      default: return fail(404, 'inconnu');
+    }
+  } catch {
+    return fail(500, 'serveur');
+  }
+}
