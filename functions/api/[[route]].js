@@ -603,7 +603,7 @@ export async function publishedReviews(env) {
   return results;
 }
 
-async function avis(path, request, env) {
+async function avis(path, request, env, waitUntil) {
   const d = await request.json().catch(() => null) || {};
   const op = path.slice('/api/avis/'.length);
   if (op === 'envoyer') {
@@ -613,6 +613,12 @@ async function avis(path, request, env) {
     if (!r) return fail(400, 'avis');
     if (!(await underLimit(env.DB, `avisu:${day()}:${await sha256hex(ip)}`, 3))) return fail(429, 'quota');
     await env.DB.prepare("INSERT INTO avis (id, note, texte, nom, cree, statut) VALUES (?1, ?2, ?3, ?4, ?5, 'attente')").bind(crypto.randomUUID(), r.note, r.texte, r.nom, new Date().toISOString()).run();
+    // prévient l'admin par e-mail (script Google, même relais que les avis des testeurs)
+    if (env.APPS_SCRIPT_URL) {
+      const mail = fetch(env.APPS_SCRIPT_URL, { method: 'POST', headers: { 'content-type': 'text/plain;charset=utf-8' }, redirect: 'follow',
+        body: JSON.stringify({ app: 'cng-vinted', relais: env.RELAIS || '', title: `Nouvel avis ${'★'.repeat(r.note)} à relire`, message: `${r.nom} :\n\n${r.texte}\n\nPour le publier : https://cngapp.com/#/admin → Avis à relire`, contact: '' }) }).catch(() => null);
+      if (waitUntil) waitUntil(mail); else await mail;
+    }
     return json({ ok: true });
   }
   if (op === 'publics') return json({ ok: true, avis: await publishedReviews(env) });
@@ -632,7 +638,7 @@ async function avis(path, request, env) {
 
 // ---------------------------------------------------------------------------
 
-export async function onRequest({ request, env }) {
+export async function onRequest({ request, env, waitUntil }) {
   const path = new URL(request.url).pathname.replace(/\/+$/, '');
   if (request.method === 'OPTIONS') return new Response(null, { status: 204 });
   if (path === '/api/script' && request.method === 'GET') return script(request, env).catch(() => fail(500, 'serveur'));
@@ -654,7 +660,7 @@ export async function onRequest({ request, env }) {
       default:
         if (path.startsWith('/api/cloud/')) return await cloud(path, request, env);
         if (path.startsWith('/api/pro/')) return await pro(path, request, env);
-        if (path.startsWith('/api/avis/')) return await avis(path, request, env);
+        if (path.startsWith('/api/avis/')) return await avis(path, request, env, waitUntil);
         return fail(404, 'inconnu');
     }
   } catch {
