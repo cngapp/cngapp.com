@@ -7,6 +7,8 @@ import { publishedReviews } from '../api/[[route]].js';
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const stars = (n) => `<span class="stars" aria-label="${n} sur 5">${'★'.repeat(n)}${'☆'.repeat(5 - n)}</span>`;
 
+export const MIN_AVIS = 5;
+
 export function renderReviews(html, reviews, site = 'https://cngapp.com') {
   const n = reviews.length;
   const avg = n ? reviews.reduce((a, r) => a + r.note, 0) / n : 0;
@@ -18,7 +20,9 @@ export function renderReviews(html, reviews, site = 'https://cngapp.com') {
   const app = {
     '@type': 'SoftwareApplication', '@id': `${site}/#app-avis`, name: 'CNG Vinted', applicationCategory: 'FinanceApplication', operatingSystem: 'iOS, Android, Web', url: `${site}/`,
     offers: { '@type': 'Offer', price: '0', priceCurrency: 'EUR' },
-    ...(n ? {
+    // Note moyenne donnée à Google seulement à partir de MIN_AVIS avis : en dessous, elle ne veut pas dire grand-chose
+    // (les avis restent affichés sur la page).
+    ...(n >= MIN_AVIS ? {
       aggregateRating: { '@type': 'AggregateRating', ratingValue: Number(avg.toFixed(2)), ratingCount: n, bestRating: 5, worstRating: 1 },
       review: reviews.slice(0, 20).map((r) => ({ '@type': 'Review', reviewRating: { '@type': 'Rating', ratingValue: r.note, bestRating: 5 }, author: { '@type': 'Person', name: r.nom }, reviewBody: r.texte, datePublished: String(r.cree).slice(0, 10) })),
     } : {}),

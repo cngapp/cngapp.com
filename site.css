@@ -43,3 +43,11 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; } footer .wrap { m
 .review blockquote { margin: 8px 0; font-size: 1.02em; line-height: 1.55; }
 .review figcaption { color: var(--mut, #a8a29e); font-size: .9em; }
 .stars { color: var(--g); letter-spacing: 2px; }
+
+/* Questions en H3 (FAQ), signature des guides, « À lire aussi » */
+summary h3 { display: inline; font-size: inherit; margin: 0; }
+h3 { font-size: 19px; margin: 24px 0 8px; }
+.byline { margin-top: -4px; }
+.related { list-style: none; padding: 0; display: grid; gap: 10px; }
+.related a { display: block; padding: 14px 18px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; text-decoration: none; color: var(--fg); font-weight: 700; }
+.note { border-left: 3px solid var(--g); padding: 4px 0 4px 14px; color: #d4d4d8; }
