@@ -36,3 +36,10 @@ table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 16px;
 .app { border-color: rgba(99, 247, 123, .35); }
 footer { border-top: 1px solid var(--line); margin-top: 32px; } footer .wrap { max-width: 960px; margin: 0 auto; padding: 20px 16px 40px; font-size: 15px; }
 .steps { padding-left: 22px; } .steps li { margin: 10px 0; }
+
+/* Avis */
+.reviews { display: grid; gap: 12px; margin: 16px 0; }
+.review { margin: 0; }
+.review blockquote { margin: 8px 0; font-size: 1.02em; line-height: 1.55; }
+.review figcaption { color: var(--mut, #a8a29e); font-size: .9em; }
+.stars { color: var(--g); letter-spacing: 2px; }
