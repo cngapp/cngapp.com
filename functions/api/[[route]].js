@@ -5,9 +5,11 @@
  *   POST /api/push/abonner      Notifications « Nouvelle tendance » (bêta) : enregistre l'abonnement du téléphone
  *   POST /api/push/desabonner   Retire l'abonnement
  *   POST /api/push/tendance     Prévient les abonnés de la dernière tendance publiée (une seule fois par tendance)
+ *   GET|POST /api/script        Tendances partagées (bêta) et statistiques d'utilisation, avec le même protocole que
+ *                               l'ancien script Google (données dans la base D1 au lieu du Drive)
  *
  * Ce fichier est public (comme le reste du site) : AUCUN secret ici. Les clés sont dans les réglages du projet
- * Cloudflare (TURNSTILE_SECRET, VAPID_PRIVATE) ; liaisons : AI (Workers AI), CNG (stockage KV).
+ * Cloudflare (TURNSTILE_SECRET, VAPID_PRIVATE, RELAIS) ; liaisons : AI (Workers AI), CNG (stockage KV), DB (base D1).
  */
 
 export const AI_FREE_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct';
@@ -50,11 +52,13 @@ export async function turnstileOk(env, token, ip, fetcher = fetch) {
   } catch { return false; }
 }
 
-/** Compteur journalier (stockage KV). Renvoie false si la limite est atteinte. */
-async function underLimit(kv, key, max) {
-  const n = Number((await kv.get(key)) || 0);
-  if (n >= max) return false;
-  await kv.put(key, String(n + 1), { expirationTtl: 2 * 86400 });
+/** Compteur (base D1, effacé au bout de 2 jours). Renvoie false si la limite est atteinte. */
+async function underLimit(db, key, max, now = Date.now()) {
+  const row = await db.prepare('SELECT n FROM compteurs WHERE cle = ?1 AND expire > ?2').bind(key, now).first();
+  if (row && row.n >= max) return false;
+  await db.prepare('INSERT INTO compteurs (cle, n, expire) VALUES (?1, 1, ?2) ON CONFLICT(cle) DO UPDATE SET n = CASE WHEN expire > ?3 THEN n + 1 ELSE 1 END, expire = CASE WHEN expire > ?3 THEN expire ELSE ?2 END')
+    .bind(key, now + 2 * 86400_000, now).run();
+  if (Math.random() < 0.02) await db.prepare('DELETE FROM compteurs WHERE expire < ?1').bind(now).run();
   return true;
 }
 
@@ -92,8 +96,8 @@ async function annonce(request, env) {
   const req = cleanListingRequest(d);
   if (!req) return fail(400, 'photos');
   const today = day();
-  if (!(await underLimit(env.CNG, `ia:${today}`, LIMITS.totalPerDay))) return fail(429, 'quota-global');
-  if (!(await underLimit(env.CNG, `ia:${today}:${await sha256hex(ip)}`, LIMITS.perIpPerDay))) return fail(429, 'quota');
+  if (!(await underLimit(env.DB, `ia:${today}`, LIMITS.totalPerDay))) return fail(429, 'quota-global');
+  if (!(await underLimit(env.DB, `ia:${today}:${await sha256hex(ip)}`, LIMITS.perIpPerDay))) return fail(429, 'quota');
   let out;
   try {
     out = await env.AI.run(AI_FREE_MODEL, {
@@ -120,12 +124,12 @@ async function retour(request, env) {
   const s = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
   const title = s(d.title, 120), message = s(d.message, 3800), contact = s(d.contact, 120), topic = s(d.topic, 80);
   if (message.trim().length < 3) return fail(400, 'message');
-  if (!(await underLimit(env.CNG, `avis:${day()}:${await sha256hex(ip)}`, 20))) return fail(429, 'quota');
+  if (!(await underLimit(env.DB, `avis:${day()}:${await sha256hex(ip)}`, 20))) return fail(429, 'quota');
   const tags = Array.isArray(d.tags) ? d.tags.filter((t) => typeof t === 'string').slice(0, 3) : [];
   const priority = [3, 4].includes(d.priority) ? d.priority : 3;
   const [mailed, pushed] = await Promise.all([
     env.APPS_SCRIPT_URL
-      ? fetch(env.APPS_SCRIPT_URL, { method: 'POST', headers: { 'content-type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ app: 'cng-vinted', title, message, contact }), redirect: 'follow' })
+      ? fetch(env.APPS_SCRIPT_URL, { method: 'POST', headers: { 'content-type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ app: 'cng-vinted', title, message, contact, relais: env.RELAIS || '' }), redirect: 'follow' })
           .then(async (r) => r.ok && (await r.json().catch(() => null))?.ok === true).catch(() => false)
       : false,
     topic ? fetch('https://ntfy.sh/', { method: 'POST', body: JSON.stringify({ topic, title, message, tags, priority }) }).then((r) => r.ok, () => false) : false,
@@ -220,9 +224,7 @@ export function latestNewTrend(items, now = Date.now()) {
 }
 
 async function tendance(env) {
-  const r = await fetch(`${env.APPS_SCRIPT_URL}?action=tendances`, { redirect: 'follow' }).catch(() => null);
-  const data = r && (await r.json().catch(() => null));
-  const t = latestNewTrend(data && data.items);
+  const t = latestNewTrend(await listTrends(env));
   if (!t) return json({ ok: true, envoyes: 0 });
   const done = `notifie:${t.id}`;
   if (await env.CNG.get(done)) return json({ ok: true, envoyes: 0 });
@@ -243,11 +245,153 @@ async function tendance(env) {
   return json({ ok: true, envoyes: sent });
 }
 
+
+// ---------------------------------------------------------------------------
+// Tendances et statistiques (même protocole que l'ancien script Google)
+// ---------------------------------------------------------------------------
+
+const TREND_FIELDS = { title: 160, brand: 80, size: 40, condition: 60, seller: 60, url: 500, text: 3000, note: 300 };
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : null);
+const MAX_PHOTO_B64 = 1_900_000;
+
+/**
+ * Admin : la clé envoyée par l'appli (empreinte du code admin, jamais le code) est comparée à l'empreinte
+ * enregistrée. Première fois : vérifiée auprès de l'ancien script Google (qui connaît le code), puis seule
+ * son empreinte est gardée ici.
+ */
+export async function isAdminKey(env, key, fetcher = fetch) {
+  if (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key)) return false;
+  const h = await sha256hex(`cng-admin:${key}`);
+  const row = await env.DB.prepare("SELECT valeur FROM reglages WHERE cle = 'admin'").first();
+  if (row) return row.valeur === h;
+  if (!env.APPS_SCRIPT_URL) return false;
+  const r = await fetcher(`${env.APPS_SCRIPT_URL}?action=presence&key=${encodeURIComponent(key)}`, { redirect: 'follow' }).catch(() => null);
+  const j = r && (await r.json().catch(() => null));
+  if (!j || j.ok !== true) return false;
+  await env.DB.prepare("INSERT OR IGNORE INTO reglages (cle, valeur) VALUES ('admin', ?1)").bind(h).run();
+  return true;
+}
+
+async function listTrends(env) {
+  const { results } = await env.DB.prepare('SELECT data FROM tendances ORDER BY added_at DESC LIMIT 300').all();
+  return results.map((r) => JSON.parse(r.data));
+}
+
+/** Une seule fois : reprend les tendances (et leurs photos) de l'ancien script Google. */
+export async function importOldTrends(env, fetcher = fetch) {
+  const done = await env.DB.prepare("SELECT valeur FROM reglages WHERE cle = 'import_tendances'").first();
+  if (done || !env.APPS_SCRIPT_URL) return 0;
+  const r = await fetcher(`${env.APPS_SCRIPT_URL}?action=tendances`, { redirect: 'follow' }).catch(() => null);
+  const j = r && (await r.json().catch(() => null));
+  if (!j || j.ok !== true || !Array.isArray(j.items)) return 0;
+  let n = 0;
+  for (const t of j.items.slice(0, 300)) {
+    if (!t || typeof t.id !== 'string') continue;
+    let photo = null;
+    if (typeof t.photo === 'string' && t.photo) {
+      const pr = await fetcher(`${env.APPS_SCRIPT_URL}?action=photo&id=${encodeURIComponent(t.photo)}`, { redirect: 'follow' }).catch(() => null);
+      const p = pr && (await pr.json().catch(() => null));
+      if (p && p.ok && typeof p.data === 'string' && p.data.length <= MAX_PHOTO_B64 && /^image\/(jpeg|png|webp)$/.test(p.mime)) {
+        photo = `p-${crypto.randomUUID()}`;
+        await env.DB.prepare('INSERT OR REPLACE INTO photos (id, mime, data) VALUES (?1, ?2, ?3)').bind(photo, p.mime, p.data).run();
+      }
+    }
+    const row = { ...t, photo };
+    const added = typeof t.addedAt === 'string' ? t.addedAt : new Date().toISOString();
+    await env.DB.prepare('INSERT OR IGNORE INTO tendances (id, data, added_at, updated_at) VALUES (?1, ?2, ?3, ?4)').bind(t.id, JSON.stringify(row), added, typeof t.updatedAt === 'string' ? t.updatedAt : added).run();
+    n++;
+  }
+  await env.DB.prepare("INSERT OR REPLACE INTO reglages (cle, valeur) VALUES ('import_tendances', ?1)").bind(new Date().toISOString()).run();
+  return n;
+}
+
+async function saveTrend(env, d) {
+  const it = d.item || {};
+  const now = new Date().toISOString();
+  const old = typeof it.id === 'string' ? await env.DB.prepare('SELECT data FROM tendances WHERE id = ?1').bind(it.id).first() : null;
+  const prev = old ? JSON.parse(old.data) : null;
+  const row = { id: prev ? prev.id : crypto.randomUUID(), photo: prev ? prev.photo : null, addedAt: prev ? prev.addedAt : now, updatedAt: now };
+  for (const [c, n] of Object.entries(TREND_FIELDS)) row[c] = String(it[c] ?? '').slice(0, n);
+  if (!/^https:\/\//i.test(row.url)) row.url = '';
+  row.price = num(it.price);
+  row.likes = num(it.likes);
+  const ph = d.photo;
+  if (ph && typeof ph.data === 'string' && /^image\/(jpeg|png|webp)$/.test(ph.mime)) {
+    if (ph.data.length > MAX_PHOTO_B64 || !/^[A-Za-z0-9+/=]+$/.test(ph.data)) return { ok: false, erreur: 'photo trop lourde' };
+    if (row.photo) await env.DB.prepare('DELETE FROM photos WHERE id = ?1').bind(row.photo).run();
+    row.photo = `p-${crypto.randomUUID()}`;
+    await env.DB.prepare('INSERT INTO photos (id, mime, data) VALUES (?1, ?2, ?3)').bind(row.photo, ph.mime, ph.data).run();
+  }
+  await env.DB.prepare('INSERT INTO tendances (id, data, added_at, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET data = ?2, updated_at = ?4')
+    .bind(row.id, JSON.stringify(row), row.addedAt, row.updatedAt).run();
+  return { ok: true, item: row };
+}
+
+async function deleteTrend(env, id) {
+  const old = await env.DB.prepare('SELECT data FROM tendances WHERE id = ?1').bind(String(id || '')).first();
+  if (old) {
+    const t = JSON.parse(old.data);
+    if (t.photo) await env.DB.prepare('DELETE FROM photos WHERE id = ?1').bind(t.photo).run();
+    await env.DB.prepare('DELETE FROM tendances WHERE id = ?1').bind(t.id).run();
+  }
+  return { ok: true };
+}
+
+async function presence(env, d) {
+  const id = String(d.id || '').slice(0, 64);
+  if (!/^[a-z0-9-]{8,64}$/.test(id)) return { ok: false };
+  const now = new Date().toISOString();
+  const old = await env.DB.prepare('SELECT data, last FROM appareils WHERE id = ?1').bind(id).first();
+  // au plus une écriture toutes les 4 minutes par appareil
+  if (old && Date.parse(old.last) > Date.now() - 4 * 60_000) return { ok: true };
+  const prev = old ? JSON.parse(old.data) : null;
+  const row = {
+    id, v: d.v === 'beta' ? 'beta' : 'officielle', build: String(d.build || '').slice(0, 12),
+    tester: d.tester ? String(d.tester).slice(0, 30) : null, device: String(d.device || '').slice(0, 80), google: d.google === true,
+    first: prev ? prev.first : now, last: now, opens: (prev ? prev.opens : 0) + 1,
+  };
+  await env.DB.prepare('INSERT INTO appareils (id, data, last) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET data = ?2, last = ?3').bind(id, JSON.stringify(row), now).run();
+  return { ok: true };
+}
+
+async function script(request, env) {
+  const url = new URL(request.url);
+  if (request.method === 'GET') {
+    const action = url.searchParams.get('action');
+    if (action === 'tendances') {
+      await importOldTrends(env).catch(() => 0);
+      return json({ ok: true, items: await listTrends(env) });
+    }
+    if (action === 'photo') {
+      const id = url.searchParams.get('id') || '';
+      const p = await env.DB.prepare('SELECT mime, data FROM photos WHERE id = ?1').bind(id).first();
+      return json(p ? { ok: true, mime: p.mime, data: p.data } : { ok: false });
+    }
+    if (action === 'presence') {
+      if (!(await isAdminKey(env, url.searchParams.get('key')))) return json({ ok: false, erreur: 'cle' });
+      const { results } = await env.DB.prepare('SELECT data FROM appareils ORDER BY last DESC LIMIT 500').all();
+      return json({ ok: true, devices: results.map((r) => JSON.parse(r.data)) });
+    }
+    return json({ ok: true, service: 'cngapp.com' });
+  }
+  const d = JSON.parse(await request.text().catch(() => 'null') || 'null');
+  if (!d || typeof d !== 'object') return json({ ok: false, erreur: 'refusé' });
+  if (d.app === 'cng-presence') return json(await presence(env, d));
+  if (d.app === 'cng-tendances') {
+    if (!(await isAdminKey(env, d.key))) return json({ ok: false, erreur: 'cle' });
+    if (d.op === 'delete') return json(await deleteTrend(env, d.id));
+    if (d.op === 'save' && d.item) return json(await saveTrend(env, d));
+    return json({ ok: false });
+  }
+  return json({ ok: false, erreur: 'refusé' });
+}
+
 // ---------------------------------------------------------------------------
 
 export async function onRequest({ request, env }) {
   const path = new URL(request.url).pathname.replace(/\/+$/, '');
   if (request.method === 'OPTIONS') return new Response(null, { status: 204 });
+  if (path === '/api/script' && request.method === 'GET') return script(request, env).catch(() => fail(500, 'serveur'));
   if (request.method !== 'POST') return fail(405, 'methode');
   // uniquement depuis le site lui-même (pas d'autres sites qui utiliseraient ces services)
   const origin = request.headers.get('origin');
@@ -259,6 +403,7 @@ export async function onRequest({ request, env }) {
       case '/api/push/abonner': return await abonner(request, env);
       case '/api/push/desabonner': return await desabonner(request, env);
       case '/api/push/tendance': return await tendance(env);
+      case '/api/script': return await script(request, env);
       default: return fail(404, 'inconnu');
     }
   } catch {
